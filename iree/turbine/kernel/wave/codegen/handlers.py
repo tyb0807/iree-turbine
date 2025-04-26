@@ -517,7 +517,7 @@ def handle_or(lhs: Value, rhs: Value, options: WaveCompileOptions) -> OpResult:
 def handle_gt(lhs: Value, rhs: Value, options: WaveCompileOptions) -> OpResult:
     element_type = get_type_or_element_type(lhs.type)
     if _is_float_type(element_type):
-        result = arith_d.cmpi(arith_d.CmpFPredicate.OGT, lhs, rhs)
+        result = arith_d.cmpf(arith_d.CmpFPredicate.OGT, lhs, rhs)
     elif _is_integer_like_type(element_type) and _is_signed_or_signless_type(
         element_type
     ):
@@ -531,7 +531,7 @@ def handle_gt(lhs: Value, rhs: Value, options: WaveCompileOptions) -> OpResult:
 def handle_ge(lhs: Value, rhs: Value, options: WaveCompileOptions) -> OpResult:
     element_type = get_type_or_element_type(lhs.type)
     if _is_float_type(element_type):
-        result = arith_d.cmpi(arith_d.CmpFPredicate.OGE, lhs, rhs)
+        result = arith_d.cmpf(arith_d.CmpFPredicate.OGE, lhs, rhs)
     elif _is_integer_like_type(element_type) and _is_signed_or_signless_type(
         element_type
     ):
@@ -545,7 +545,7 @@ def handle_ge(lhs: Value, rhs: Value, options: WaveCompileOptions) -> OpResult:
 def handle_lt(lhs: Value, rhs: Value, options: WaveCompileOptions) -> OpResult:
     element_type = get_type_or_element_type(lhs.type)
     if _is_float_type(element_type):
-        result = arith_d.cmpi(arith_d.CmpFPredicate.OLT, lhs, rhs)
+        result = arith_d.cmpf(arith_d.CmpFPredicate.OLT, lhs, rhs)
     elif _is_integer_like_type(element_type) and _is_signed_or_signless_type(
         element_type
     ):
@@ -559,7 +559,7 @@ def handle_lt(lhs: Value, rhs: Value, options: WaveCompileOptions) -> OpResult:
 def handle_le(lhs: Value, rhs: Value, options: WaveCompileOptions) -> OpResult:
     element_type = get_type_or_element_type(lhs.type)
     if _is_float_type(element_type):
-        result = arith_d.cmpi(arith_d.CmpFPredicate.OLE, lhs, rhs)
+        result = arith_d.cmpf(arith_d.CmpFPredicate.OLE, lhs, rhs)
     elif _is_integer_like_type(element_type) and _is_signed_or_signless_type(
         element_type
     ):
@@ -646,6 +646,19 @@ def handle_neg(source: Value, options: WaveCompileOptions) -> OpResult:
         raise ValidationError(
             f"Found unhandled operand type for negate: {element_type}"
         )
+    return result
+
+
+@handle_unary_op(operator.invert)
+def handle_invert(source: Value, options: WaveCompileOptions) -> OpResult:
+    element_type = get_type_or_element_type(source.type)
+    if _is_integer_like_type(element_type):
+        one = arith_d.ConstantOp(source.type, 1)
+        zero = arith_d.ConstantOp(source.type, 0)
+        neg_one = arith_d.subi(zero, one)
+        result = arith_d.xori(source, neg_one)
+    else:
+        raise ValidationError(f"Inversion is not supported for type: {element_type}")
     return result
 
 
@@ -946,7 +959,8 @@ def handle_iterate_while(emitter: WaveEmitter, node: fx.Node):
     # Initialize while loop
     init_value = cast_py_value(emitter, start).ir_value
     if isinstance(init_value.type, VectorType):
-        init_value = vector_d.extractelement(init_value, [0])
+        zero = arith_d.ConstantOp(IndexType.get(), 0)
+        init_value = vector_d.extractelement(init_value, position=zero)
     if isinstance(init_value.type, IntegerType):
         init_value = arith_d.index_cast(IndexType.get(), init_value)
 
@@ -965,9 +979,20 @@ def handle_iterate_while(emitter: WaveEmitter, node: fx.Node):
     with InsertionPoint(whileOp.before.blocks[0]):
         # Replace the axis with a temporary variable when generating the condition
         # to avoid conflicts with the actual value of the axis.
-        condition = condition.subs({axis: index_symbol("$TMP")})
+        condition = condition.subs({axis: sympy.Symbol("$TMP")})
         subs = add_emitter_subs(emitter)
-        subs[index_symbol("$TMP")] = current_values[-1]
+        subs[sympy.Symbol("$TMP")] = current_values[-1]
+        # Replace iter args with appropriate values.
+        for i in range(len(current_values) - 1):
+            value = current_values[i]
+            if isinstance(value.type, VectorType):
+                assert (
+                    value.type.rank == 1
+                ), f"Expected vector of rank 1, got {value.type}"
+                value = vector_d.extractelement(current_values[i], position=zero)
+            if isinstance(value.type, IntegerType):
+                value = arith_d.index_cast(IndexType.get(), value)
+            subs[GET_ITER_ARG(i)] = value
         condition = gen_sympy_index(subs, condition)
         scf_d.ConditionOp(condition, current_values)
 
