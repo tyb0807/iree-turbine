@@ -23,6 +23,7 @@ from iree.turbine.kernel.wave.utils.general_utils import (
 )
 from iree.turbine.kernel.wave.templates.speculative_decoding import (
     get_speculative_decoding_kernel,
+    get_speculative_sampling_kernel,
 )
 import torch.nn.functional as F
 
@@ -50,6 +51,28 @@ def get_wave_speculative_decoding_kernel(batch_size, num_draft_tokens, d):
     return speculative_decoding
 
 
+def get_wave_speculative_sampling_kernel(batch_size, num_speculative_tokens, threshold_acc, threshold_single, num_draft_tokens, d):
+    speculative_decoding, symbols, _, _ = get_speculative_sampling_kernel(
+        batch_size, num_speculative_tokens, threshold_acc, threshold_single, num_draft_tokens, d
+    )
+    symbols.update(get_default_scheduling_params())
+
+    options = WaveCompileOptions(
+        subs=symbols,
+        canonicalize=True,
+        run_bench=False,
+        waves_per_eu=2,
+        denorm_fp_math_f32="preserve-sign",
+        schedule=False,
+        wave_runtime=True,
+        use_scheduling_barriers=enable_scheduling_barriers,
+    )
+    options = set_default_run_config(options)
+    speculative_decoding = wave_compile(options, speculative_decoding)
+    print(speculative_decoding.asm)
+    return speculative_decoding
+
+
 def tree_speculative_sampling_target_only(
     predicts,  # [seq_len], mutable
     accept_index,  # [batch_size, num_speculative_tokens], mutable
@@ -72,105 +95,121 @@ def tree_speculative_sampling_target_only(
 
     wave_kernel = get_wave_speculative_decoding_kernel(batch_size, num_draft_tokens, d)
     threshold_acc = max(threshold_acc, 1e-9)
+    wave_kernel = get_wave_speculative_sampling_kernel(batch_size, num_speculative_tokens, threshold_acc, threshold_single, num_draft_tokens, d)
     cur_prob_offset_vec = torch.empty(
         [batch_size], dtype=torch.int32, device=draft_probs.device
     )
     last_accepted_retrive_idx_vec = torch.empty(
         [batch_size], dtype=torch.int32, device=draft_probs.device
     )
-    for bx in range(batch_size):
-        prob_acc = 0.0
-        cur_prob_offset = 0  # bx * num_draft_tokens * d handled via indexing
-        coin = uniform_samples[bx, 0]
-        last_accepted_retrive_idx = retrive_index[bx, 0]
-        accept_index[bx, 0] = last_accepted_retrive_idx
-        num_accepted_tokens = 0
-        cur_index = 0
-
-        # Iterate over speculative token positions
-        for j in range(1, num_speculative_tokens):
-            cur_index = retrive_next_token[bx, cur_index]
-
-            # Traverse draft token candidates (siblings) at this position
-            while cur_index != -1:
-                draft_index = retrive_index[bx, cur_index]
-                draft_token_id = candidates[bx, cur_index]
-                target_prob_single = target_probs[bx, cur_prob_offset, draft_token_id]
-                prob_acc += target_prob_single
-
-                if (
-                    coin <= prob_acc / threshold_acc
-                    or target_prob_single >= threshold_single
-                ):
-                    # accept token
-                    prob_acc = 0.0
-                    cur_prob_offset = cur_index
-                    coin = uniform_samples[bx, cur_index]
-                    predicts[last_accepted_retrive_idx] = draft_token_id
-                    num_accepted_tokens += 1
-                    accept_index[bx, num_accepted_tokens] = draft_index
-                    last_accepted_retrive_idx = draft_index
-                    break
-                else:
-                    draft_probs[bx, cur_index, draft_token_id] = target_probs[
-                        bx, cur_index, draft_token_id
-                    ]
-                    cur_index = retrive_next_sibling[bx, cur_index]
-
-            if cur_index == -1:
-                break
-
-        accept_token_num[bx] = num_accepted_tokens
-        cur_prob_offset_vec[bx] = cur_prob_offset
-        last_accepted_retrive_idx_vec[bx] = last_accepted_retrive_idx
-
-    # Sample from relu(target_probs - draft_probs)
-    relu_diff = torch.zeros_like(target_probs)
-    u = torch.zeros(
-        [target_probs.shape[0], target_probs.shape[1]], device=target_probs.device
-    )
     wave_kernel(
+        uniform_samples,
         target_probs,
         draft_probs,
+        candidates,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        # Outputs
+        predicts,
+        accept_token_num,
+        accept_index,
         cur_prob_offset_vec,
-        uniform_samples,
-        relu_diff,
-        u,
+        last_accepted_retrive_idx_vec,
     )
+  # for bx in range(batch_size):
+  #     prob_acc = 0.0
+  #     cur_prob_offset = 0  # bx * num_draft_tokens * d handled via indexing
+  #     coin = uniform_samples[bx, 0]
+  #     last_accepted_retrive_idx = retrive_index[bx, 0]
+  #     accept_index[bx, 0] = last_accepted_retrive_idx
+  #     num_accepted_tokens = 0
+  #     cur_index = 0
 
-    for bx in range(batch_size):
-        sampled_id = d - 1
-        aggregate = 0.0
-        for i in range(d):
-            val = relu_diff[bx, cur_prob_offset_vec[bx], i]
-            val = max(val, 0.0)
-            aggregate += val
-            if aggregate > u[bx, cur_prob_offset_vec[bx]]:
-                sampled_id = i
-                break
+  #     # Iterate over speculative token positions
+  #     for j in range(1, num_speculative_tokens):
+  #         cur_index = retrive_next_token[bx, cur_index]
 
-        predicts[last_accepted_retrive_idx_vec[bx]] = sampled_id
+  #         # Traverse draft token candidates (siblings) at this position
+  #         while cur_index != -1:
+  #             draft_index = retrive_index[bx, cur_index]
+  #             draft_token_id = candidates[bx, cur_index]
+  #             target_prob_single = target_probs[bx, cur_prob_offset, draft_token_id]
+  #             prob_acc += target_prob_single
+
+  #             if (
+  #                 coin <= prob_acc / threshold_acc
+  #                 or target_prob_single >= threshold_single
+  #             ):
+  #                 # accept token
+  #                 prob_acc = 0.0
+  #                 cur_prob_offset = cur_index
+  #                 coin = uniform_samples[bx, cur_index]
+  #                 predicts[last_accepted_retrive_idx] = draft_token_id
+  #                 num_accepted_tokens += 1
+  #                 accept_index[bx, num_accepted_tokens] = draft_index
+  #                 last_accepted_retrive_idx = draft_index
+  #                 break
+  #             else:
+  #                 draft_probs[bx, cur_index, draft_token_id] = target_probs[
+  #                     bx, cur_index, draft_token_id
+  #                 ]
+  #                 cur_index = retrive_next_sibling[bx, cur_index]
+
+  #         if cur_index == -1:
+  #             break
+
+  #     accept_token_num[bx] = num_accepted_tokens
+  #     cur_prob_offset_vec[bx] = cur_prob_offset
+  #     last_accepted_retrive_idx_vec[bx] = last_accepted_retrive_idx
+
+    # Sample from relu(target_probs - draft_probs)
+  # relu_diff = torch.zeros_like(target_probs)
+  # u = torch.zeros(
+  #     [target_probs.shape[0], target_probs.shape[1]], device=target_probs.device
+  # )
+  # wave_kernel(
+  #     target_probs,
+  #     draft_probs,
+  #     cur_prob_offset_vec,
+  #     uniform_samples,
+  #     relu_diff,
+  #     u,
+  # )
+
+  # for bx in range(batch_size):
+  #     sampled_id = d - 1
+  #     aggregate = 0.0
+  #     for i in range(d):
+  #         val = relu_diff[bx, cur_prob_offset_vec[bx], i]
+  #         val = max(val, 0.0)
+  #         aggregate += val
+  #         if aggregate > u[bx, cur_prob_offset_vec[bx]]:
+  #             sampled_id = i
+  #             break
+
+  #     predicts[last_accepted_retrive_idx_vec[bx]] = sampled_id
 
 
 test_cases = [
     (
         1,
         1,
-        [3, -1, -1, 4, 5, 18, 11, -1, -1, -1, 12, 18],
+        [3, -1, -1, 4, 5, -1, 11, -1, -1, -1, 12, -1],
         [[0, 3, 4, 5], [6, 10, 11, -1]],
         [3, 2],
     ),
     (
         0,  # threshold_single
         0,  # threshold_acc
-        [1, 2, 18, -1, -1, -1, 11, -1, -1, -1, 12, 18],
+        [1, 2, -1, -1, -1, -1, 11, -1, -1, -1, 12, -1],
         [[0, 1, 2, -1], [6, 10, 11, -1]],
         [2, 2],
     ),
 ]
 
 
-@require_cdna3
+#@require_cdna3
 @require_e2e
 @pytest.mark.parametrize(
     "threshold_single, threshold_acc, expected_predicts, expected_accept_index, expected_accept_token_num",

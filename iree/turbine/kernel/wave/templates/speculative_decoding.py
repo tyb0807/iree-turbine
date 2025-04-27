@@ -119,6 +119,10 @@ def get_speculative_decoding_kernel(
 def get_speculative_sampling_kernel(
     batch_size: int,
     num_speculative_tokens: int,
+    threshold_acc: float,
+    threshold_single: float,
+    num_draft_tokens: int,
+    d: int,
 ):
     CUR_INDEX = sympy.Symbol("CUR_INDEX")
     J = sympy.Symbol("J")
@@ -134,7 +138,7 @@ def get_speculative_sampling_kernel(
         tkw.HardwareConstraint(
             threads_per_wave=64,
             waves_per_block=(1, 1, 1),
-            vector_shapes={B: batch_size, J: 0, CUR_INDEX: 0, S: 0, D: 20},
+            vector_shapes={B: num_draft_tokens, J: 0, CUR_INDEX: 0, S: 0, D: d},
         )
     ]
     constraints += [tkw.WorkgroupConstraint(S, BLOCK_S, 0)]
@@ -143,12 +147,12 @@ def get_speculative_sampling_kernel(
 
     hyperparams = {
         BLOCK_B: 1,
-        B: batch_size,
+        B: num_draft_tokens,
         ADDRESS_SPACE: SHARED_ADDRESS_SPACE,
         ADDRESS_SPACE_0: GLOBAL_ADDRESS_SPACE,
-        S: 10,
+        S: batch_size,
         BLOCK_S: 1,
-        D: 20,
+        D: d,
     }
     dynamic_symbols = []
     dynamic_symbols_map = {}
@@ -157,6 +161,7 @@ def get_speculative_sampling_kernel(
     DRAFT_TOKEN_ID = tkl.sym.DRAFT_TOKEN_ID
     NUM_ACCEPTED_TOKENS = tkl.sym.NUM_ACCEPTED_TOKENS
     LAST_ACCEPTED_RETRIEVE_IDX = tkl.sym.LAST_ACCEPTED_RETRIEVE_IDX
+
     i = tkw.IndexMapping.iterator(0)
     j = tkw.IndexMapping.iterator(1)
     k = tkw.IndexMapping.iterator(2)
@@ -178,6 +183,12 @@ def get_speculative_sampling_kernel(
         outputs={S: i, B: j, D: k},
     )
 
+    read_zero_offset_2d_mapping = tkw.IndexMapping(
+        num_iterators=2,
+        inputs={S: i, B: sympy.Integer(0)},
+        outputs={S: i, B: j},
+    )
+
     write_mapping_2d = tkw.IndexMapping(
         num_iterators=2,
         inputs={S: i, B: j},
@@ -196,8 +207,17 @@ def get_speculative_sampling_kernel(
         outputs={S: i, B: CUR_INDEX, D: DRAFT_TOKEN_ID},
     )
 
+    write_zero_offset_mapping = tkw.IndexMapping(
+        num_iterators=2,
+        inputs={S: i, B: j},
+        outputs={S: i, B: sympy.Integer(0)},
+    )
+
     def broadcast(x):
         return tkw.broadcast(x, target_shape=[S, B, D])
+
+    def read_with_zero_offset_2d(memory):
+        return tkw.read(memory, elements_per_thread=1, mapping=read_zero_offset_2d_mapping)
 
     def read_2d(x):
         return tkw.read(x, elements_per_thread=1, mapping=mapping_2d)
@@ -216,6 +236,9 @@ def get_speculative_sampling_kernel(
 
     def write_3d(x, y):
         return tkw.write(x, y, elements_per_thread=1, mapping=write_mapping_3d)
+
+    def write_to_zero_offset(value, memory):
+        return tkw.write(value, memory, elements_per_thread=1, mapping=write_zero_offset_mapping)
 
     # Kernel.
     # =================================================================================
@@ -242,8 +265,12 @@ def get_speculative_sampling_kernel(
         zero_j = tkw.Register[J, tkl.i32](0)
         one_j = tkw.Register[J, tkl.i32](1)
 
-        threshold_acc = tkw.Register[S, B, D, tkl.f32](0.01)
-        threshold_single = tkw.Register[S, B, D, tkl.f32](0.01)
+        threshold_acc_reg = tkw.Register[S, B, D, tkl.f32](threshold_acc)
+        threshold_single_reg = tkw.Register[S, B, D, tkl.f32](threshold_single)
+
+        last_accepted_retrieve_idx = read_with_zero_offset_2d(retrieve_index)
+        coin = read_with_zero_offset_2d(uniform_samples)
+        write_to_zero_offset(last_accepted_retrieve_idx, accept_index)
 
         outer_loop_condition = (J < num_speculative_tokens) & (
             sympy.Eq(GET_ITER_ARG(6), 0)
@@ -299,11 +326,14 @@ def get_speculative_sampling_kernel(
                 tkw.set_symbol(DRAFT_TOKEN_ID, draft_token_id)
                 tkw.set_symbol(CUR_PROB_OFFSET, cur_prob_offset)
                 target_prob_single = read_3d(target_probs)
+                prob_acc += target_prob_single
 
-                condition = (coin <= (prob_acc / threshold_acc)) | (
-                    target_prob_single <= threshold_single
+                condition = (coin <= (prob_acc / threshold_acc_reg)) | (
+                    target_prob_single >= threshold_single_reg
                 )
-                not_condition = ~condition
+                not_condition = (coin > (prob_acc / threshold_acc_reg)) & (
+                    target_prob_single < threshold_single_reg
+                )
 
                 # Update num_accepted_tokens if the condition is true.
                 num_accepted_tokens = tkw.select(
@@ -347,7 +377,7 @@ def get_speculative_sampling_kernel(
                 prob_acc = tkw.select(
                     condition,
                     zero_f32,
-                    prob_acc + target_prob_single,
+                    prob_acc,
                 )
 
                 # Update cur_index.
