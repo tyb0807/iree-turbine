@@ -18,6 +18,7 @@ from ...ops.wave_ops import (
     Placeholder,
     Read,
     ReduceOp,
+    NewRegister,
     SetWavePrio,
     SharedMemoryBarrier,
     Iterate,
@@ -227,6 +228,8 @@ def verify_nodes(trace: CapturedTrace, constraints: list[Constraint]):
         if isinstance(custom, (SharedMemoryBarrier, SetWavePrio, WorkgroupBarrier)):
             continue
         if isinstance(custom.type, DataType):
+            continue
+        if isinstance(custom, NewRegister):
             continue
         assert custom.index, f"Index not set for node {custom.fx_node}: {custom}"
 

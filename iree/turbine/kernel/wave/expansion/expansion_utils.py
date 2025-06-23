@@ -125,7 +125,7 @@ def get_dim_scaling(
     not_computed = lambda dim: dim not in dim_scaling
 
     for dim in node.indexing_dims:
-        if not_computed(dim) and is_static_dim(dim) and is_non_batch(dim):
+        if not_computed(dim) and is_static_dim(dim) and dim in node.vector_shapes and is_non_batch(dim):
             dim_scaling[dim] = idxc.get_static_value(dim) // node.vector_shapes[dim]
 
     # For reduce ops, also include the reduction dimension.

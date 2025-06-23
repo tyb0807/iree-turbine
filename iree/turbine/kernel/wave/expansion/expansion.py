@@ -771,6 +771,7 @@ def expand_graph(
         logger.warning(
             f"No leaf operations found in kernel. Using final operation {final_op}"
         )
+  # print("ORIG ", trace.region_graph)
     expansion_context = ExpansionContext()
     for custom in leaf_ops:
         for dim_combination in get_dim_combinations(custom, constraints):
@@ -781,11 +782,16 @@ def expand_graph(
                 expansion_context,
             )
 
+  # print("AFTER 1 ", trace.region_graph)
     # Fixup all reduction nodes.
     fixup_reduction_nodes(trace, expansion_context)
+  # print("AFTER 2 ", trace.region_graph)
     # Fixup all mma nodes.
     fixup_mma_nodes(trace, expansion_context)
+  # print("AFTER 3 ", trace.region_graph)
     # Remove original nodes in root graph.
     remove_original_nodes(leaf_ops)
+  # print("AFTER 4 ", trace.region_graph)
     remove_unused_registers(trace)
     remove_unused_iter_args(trace)
+  # print("AFTER 5 ", trace.region_graph)
